@@ -1,3 +1,3 @@
 module github.com/kklab-com/goth-kkstdcatcher
 
-go 1.14
+go 1.16

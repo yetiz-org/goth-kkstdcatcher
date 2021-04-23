@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"io"
 	"os"
-	"strings"
 	"sync"
 	"time"
 )
@@ -14,9 +13,12 @@ var (
 	gStderr          = os.Stderr
 	shutdown         = false
 	shutdownWG       = sync.WaitGroup{}
-	WriteOutInterval = 100 * time.Millisecond
+	once             = sync.Once{}
+	WriteOutInterval = 10 * time.Millisecond
 	StdoutWriteFunc  = func(s string) {}
 	StderrWriteFunc  = func(s string) {}
+	stdoutChan       = make(chan string, 16)
+	stderrChan       = make(chan string, 16)
 )
 
 func _RunCatch() {
@@ -24,60 +26,71 @@ func _RunCatch() {
 	stderrR, stderrW, _ := os.Pipe()
 	os.Stdout = stdoutW
 	os.Stderr = stderrW
-	var stdoutBuf bytes.Buffer
-	var stderrBuf bytes.Buffer
-	for {
-		if shutdown {
-			break
-		}
 
-		next := time.Now().Add(WriteOutInterval)
-		stdoutR.SetReadDeadline(next)
-		stderrR.SetReadDeadline(next)
-		if wc, err := io.Copy(&stdoutBuf, stdoutR); err != nil && !os.IsTimeout(err) {
-			println(err.Error())
-			shutdownWG.Add(1)
-			shutdown = true
-			continue
-		} else if wc > 0 {
-			if str := stdoutBuf.String(); str != "" {
+	go func() {
+		shutdownWG.Add(1)
+		var stdoutBuf bytes.Buffer
+		for !shutdown {
+			stdoutR.SetReadDeadline(time.Now().Add(WriteOutInterval))
+			if wc, err := io.Copy(&stdoutBuf, stdoutR); err == nil && wc > 0 {
+				stdoutChan <- stdoutBuf.String()
 				stdoutBuf = bytes.Buffer{}
-				for _, s := range strings.Split(str, "\n") {
-					StdoutWriteFunc(s)
-				}
+			} else if err != nil && !os.IsTimeout(err) {
+				println(err.Error())
+				shutdown = true
+				continue
+			}
+		}
 
+		stdoutW.Close()
+		shutdownWG.Done()
+	}()
+
+	go func() {
+		for !shutdown {
+			select {
+			case str := <-stdoutChan:
+				StdoutWriteFunc(str)
 				gStdout.WriteString(str)
-			}
-		}
-
-		if wc, err := io.Copy(&stderrBuf, stderrR); err != nil && !os.IsTimeout(err) {
-			println(err.Error())
-			shutdownWG.Add(1)
-			shutdown = true
-			continue
-		} else if wc > 0 {
-			if str := stderrBuf.String(); str != "" {
-				stderrBuf = bytes.Buffer{}
-				for _, s := range strings.Split(str, "\n") {
-					StderrWriteFunc(s)
-				}
-
+			case str := <-stderrChan:
+				StderrWriteFunc(str)
 				gStderr.WriteString(str)
+			case <-time.After(WriteOutInterval):
+				continue
 			}
 		}
-	}
 
-	stdoutW.Close()
-	stderrW.Close()
-	shutdownWG.Done()
+		close(stdoutChan)
+		close(stderrChan)
+	}()
+
+	go func() {
+		shutdownWG.Add(1)
+		var stderrBuf bytes.Buffer
+		for !shutdown {
+			stderrR.SetReadDeadline(time.Now().Add(WriteOutInterval))
+			if wc, err := io.Copy(&stderrBuf, stderrR); err == nil && wc > 0 {
+				stderrChan <- stderrBuf.String()
+				stderrBuf = bytes.Buffer{}
+			} else if err != nil && !os.IsTimeout(err) {
+				println(err.Error())
+				shutdown = true
+				continue
+			}
+		}
+
+		stderrW.Close()
+		shutdownWG.Done()
+	}()
 }
 
 func Start() {
-	go _RunCatch()
+	once.Do(func() {
+		_RunCatch()
+	})
 }
 
 func ShutdownGracefully() {
-	shutdownWG.Add(1)
 	shutdown = true
 	shutdownWG.Wait()
 }
