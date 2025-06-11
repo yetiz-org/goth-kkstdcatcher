@@ -1,3 +1,3 @@
-module github.com/kklab-com/goth-kkstdcatcher
+module github.com/yetiz-org/goth-kkstdcatcher
 
 go 1.22
