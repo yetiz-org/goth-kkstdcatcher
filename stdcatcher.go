@@ -21,30 +21,30 @@ var (
 type StdCatcher struct {
 	// Original file descriptors to restore later
 	stdin, stdout, stderr *os.File
-	
+
 	// Pipe file descriptors for capturing streams
 	stdinR, stdinW, stdoutR, stdoutW, stderrR, stderrW *os.File
-	
+
 	// Synchronization primitives
 	shutdownCtx    context.Context
 	shutdownCancel context.CancelFunc
 	shutdownWG     sync.WaitGroup
 	mu             sync.RWMutex // Protects concurrent access to state and configuration
-	
+
 	// Configuration parameters
 	stdReadIntervalMs int
-	
+
 	// Adaptive polling system for CPU optimization
 	lastActivityTime int64 // Unix timestamp in milliseconds for activity tracking
 	pollingMode      int32 // Atomic: 0=fast(1ms), 1=normal(10ms), 2=slow(50ms)
-	
+
 	// State management with atomic operations for thread safety
 	shutdownSig int32 // Atomic: shutdown signal flag
 	isRunning   int32 // Atomic: running state flag
-	
+
 	// Callback functions for handling captured data (thread-safe)
 	StdinWriteFunc, StdoutWriteFunc, StderrWriteFunc func(s string)
-	
+
 	// Buffered channels for high-throughput streaming captured data
 	stdinChan, stdoutChan, stderrChan chan string
 }
@@ -61,11 +61,10 @@ func NewStdCatcher() *StdCatcher {
 		StdinWriteFunc:    func(s string) {},
 		StdoutWriteFunc:   func(s string) {},
 		StderrWriteFunc:   func(s string) {},
-		// Optimized channel capacity for high-throughput scenarios
-		// 128 buffer size provides better performance for burst writes
-		stdinChan:         make(chan string, 128),
-		stdoutChan:        make(chan string, 128),
-		stderrChan:        make(chan string, 128),
+		// Buffered channels for high-throughput streaming
+		stdinChan:  make(chan string, 2048),
+		stdoutChan: make(chan string, 2048),
+		stderrChan: make(chan string, 2048),
 	}
 }
 
@@ -113,19 +112,19 @@ func (s *StdCatcher) GetStats() StdCatcherStats {
 func (s *StdCatcher) Start() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	// Check if already running
 	if atomic.LoadInt32(&s.isRunning) == 1 {
 		return fmt.Errorf("stdcatcher is already running")
 	}
-	
+
 	// Create new context and WaitGroup for this start cycle to avoid reuse issues
 	s.shutdownCtx, s.shutdownCancel = context.WithCancel(context.Background())
 	s.shutdownWG = sync.WaitGroup{} // Reset WaitGroup
-	
+
 	// Store original file descriptors
 	s.stdin, s.stdout, s.stderr = os.Stdin, os.Stdout, os.Stderr
-	
+
 	// Create pipes with error handling
 	var err error
 	if s.stdinR, s.stdinW, err = os.Pipe(); err != nil {
@@ -143,22 +142,22 @@ func (s *StdCatcher) Start() error {
 		s.stdoutW.Close()
 		return fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
-	
+
 	// Redirect standard streams
 	os.Stdin = s.stdinR
 	os.Stdout = s.stdoutW
 	os.Stderr = s.stderrW
-	
+
 	// Mark as running
 	atomic.StoreInt32(&s.isRunning, 1)
-	
+
 	// Start capture goroutines
 	go s.stdCatchRun(s.stdoutR, s.stdoutChan, "stdout")
 	go s.stdCatchRun(s.stderrR, s.stderrChan, "stderr")
-	
+
 	// Start distribution goroutine
 	go s.distributeOutput()
-	
+
 	return nil
 }
 
@@ -167,7 +166,7 @@ func (s *StdCatcher) getAdaptiveTimeout() time.Duration {
 	now := time.Now().UnixMilli()
 	lastActivity := atomic.LoadInt64(&s.lastActivityTime)
 	idleTime := now - lastActivity
-	
+
 	// Adaptive timeout strategy:
 	// 0-100ms: 1ms (real-time for immediate activity)
 	// 100ms-1s: 10ms (normal responsiveness)
@@ -195,12 +194,12 @@ func (s *StdCatcher) updateActivityTime() {
 func (s *StdCatcher) stdCatchRun(stdR *os.File, stdChan chan string, streamName string) {
 	s.shutdownWG.Add(1)
 	defer s.shutdownWG.Done()
-	
+
 	// Use optimized buffer size for better I/O performance
 	// 4KB provides optimal balance between memory usage and read efficiency
 	buf := make([]byte, 4096)
 	consecutiveTimeouts := 0
-	
+
 	for {
 		select {
 		case <-s.shutdownCtx.Done():
@@ -210,12 +209,12 @@ func (s *StdCatcher) stdCatchRun(stdR *os.File, stdChan chan string, streamName 
 			timeout := s.getAdaptiveTimeout()
 			stdR.SetReadDeadline(time.Now().Add(timeout))
 			n, err := stdR.Read(buf)
-			
+
 			// Process any available data immediately
 			if n > 0 {
-				s.updateActivityTime() // Record activity for adaptive polling
-				consecutiveTimeouts = 0  // Reset timeout counter
-				
+				s.updateActivityTime()  // Record activity for adaptive polling
+				consecutiveTimeouts = 0 // Reset timeout counter
+
 				data := string(buf[:n])
 				select {
 				case stdChan <- data:
@@ -224,7 +223,7 @@ func (s *StdCatcher) stdCatchRun(stdR *os.File, stdChan chan string, streamName 
 				}
 				continue // Immediate next read after data
 			}
-			
+
 			if err != nil {
 				if os.IsTimeout(err) {
 					consecutiveTimeouts++
@@ -256,34 +255,28 @@ func (s *StdCatcher) stdCatchRun(stdR *os.File, stdChan chan string, streamName 
 func (s *StdCatcher) distributeOutput() {
 	s.shutdownWG.Add(1)
 	defer s.shutdownWG.Done()
-	
+
 	for {
 		select {
 		case <-s.shutdownCtx.Done():
 			// Drain remaining data from channels before closing
 			s.drainChannels()
 			return
-			
+
 		case data := <-s.stdoutChan:
-			// Process stdout data immediately
 			if s.StdoutWriteFunc != nil {
 				s.StdoutWriteFunc(data)
 			}
-			// Write to original stdout immediately for real-time display
 			if s.stdout != nil {
 				s.stdout.WriteString(data)
-				s.stdout.Sync() // Force immediate flush for real-time output
 			}
-			
+
 		case data := <-s.stderrChan:
-			// Process stderr data immediately  
 			if s.StderrWriteFunc != nil {
 				s.StderrWriteFunc(data)
 			}
-			// Write to original stderr immediately for real-time display
 			if s.stderr != nil {
 				s.stderr.WriteString(data)
-				s.stderr.Sync() // Force immediate flush for real-time output
 			}
 		}
 	}
@@ -294,7 +287,7 @@ func (s *StdCatcher) distributeOutput() {
 func (s *StdCatcher) drainChannels() {
 	// Set a reasonable timeout to prevent hanging during shutdown
 	timeout := time.After(500 * time.Millisecond)
-	
+
 	for {
 		select {
 		case data := <-s.stdoutChan:
@@ -303,7 +296,6 @@ func (s *StdCatcher) drainChannels() {
 			}
 			if s.stdout != nil {
 				s.stdout.WriteString(data)
-				s.stdout.Sync()
 			}
 		case data := <-s.stderrChan:
 			if s.StderrWriteFunc != nil {
@@ -311,7 +303,6 @@ func (s *StdCatcher) drainChannels() {
 			}
 			if s.stderr != nil {
 				s.stderr.WriteString(data)
-				s.stderr.Sync()
 			}
 		case <-timeout:
 			// Timeout reached, stop draining to prevent hanging
@@ -327,17 +318,17 @@ func (s *StdCatcher) drainChannels() {
 func (s *StdCatcher) ShutdownGracefully() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	// Check if not running
 	if atomic.LoadInt32(&s.isRunning) == 0 {
 		return fmt.Errorf("stdcatcher is not running")
 	}
-	
+
 	// Signal shutdown
 	if s.shutdownCancel != nil {
 		s.shutdownCancel()
 	}
-	
+
 	// Wait for all goroutines to finish with timeout to prevent hanging
 	// Use a buffered channel to avoid goroutine leak on timeout
 	done := make(chan struct{}, 1)
@@ -351,7 +342,7 @@ func (s *StdCatcher) ShutdownGracefully() error {
 		}()
 		s.shutdownWG.Wait()
 	}()
-	
+
 	select {
 	case <-done:
 		// Normal shutdown completed
@@ -359,7 +350,7 @@ func (s *StdCatcher) ShutdownGracefully() error {
 		// Force shutdown after timeout
 		fmt.Printf("Warning: StdCatcher shutdown timed out after 2 seconds\n")
 	}
-	
+
 	// Restore original streams
 	if s.stdin != nil {
 		os.Stdin = s.stdin
@@ -370,7 +361,7 @@ func (s *StdCatcher) ShutdownGracefully() error {
 	if s.stderr != nil {
 		os.Stderr = s.stderr
 	}
-	
+
 	// Close pipes
 	if s.stdinR != nil {
 		s.stdinR.Close()
@@ -396,18 +387,18 @@ func (s *StdCatcher) ShutdownGracefully() error {
 		s.stderrW.Close()
 		s.stderrW = nil
 	}
-	
-	// Recreate channels for next use with optimized buffer capacity
+
+	// Recreate channels for next use
 	close(s.stdinChan)
 	close(s.stdoutChan)
 	close(s.stderrChan)
-	s.stdinChan = make(chan string, 128)
-	s.stdoutChan = make(chan string, 128)
-	s.stderrChan = make(chan string, 128)
-	
+	s.stdinChan = make(chan string, 2048)
+	s.stdoutChan = make(chan string, 2048)
+	s.stderrChan = make(chan string, 2048)
+
 	// Mark as not running
 	atomic.StoreInt32(&s.isRunning, 0)
-	
+
 	return nil
 }
 
